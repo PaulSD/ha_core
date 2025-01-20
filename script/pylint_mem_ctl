@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+set -e
+
+#
+# Attempt to control pylint memory usage by splitting large runs and/or limiting parallel execution.
+#
+
+#
+# This script was designed for use in Home Assistant Core, but may be useful in other projects that
+# run `pylint` on a very large number of files.
+#
+# Given that Home Assistant contributors typically only run pylint on changed files (not all files),
+# the Home Assistant developers rejected this solution as "too complex", and instead opted to simply
+# disable parallel execution and not support development systems with insufficient RAM to handle a
+# non-parallel run: https://github.com/home-assistant/core/pull/136020
+#
+# However, this script is easy to hack into Home Assistant Core if/when needed:
+# Copy this script to `script/pylint_mem_ctl`, then edit `.pre-commit-config.yaml` and change:
+#   entry: script/run-in-env.sh pylint --ignore-missing-annotations=y
+# to:
+#   entry: script/run-in-env.sh script/pylint_mem_ctl pylint --ignore-missing-annotations=y
+#
+# If using this script in other projects, note that this script assumes that all files to be scanned
+# are individually passed on the command line (since Home Assistant Core runs `pylint` via
+# `pre-commit` configured such that files are passed individually).  As currently written, this
+# script will NOT correctly split runs or control parallel execution if a directory is passed to
+# `pylint`.
+#
+
+#
+# Details:
+#
+# If pylint is run on many files at once, it may consume a significant amount of memory (presumably
+# primarily for the type inference cache).  This isn't necessarily linear with the number of files
+# checked, but as a rough approximation, pylint (3.3.1) seems to use ~75MB for the first file plus
+# ~.34MB of memory for each additional file.
+#
+# If pylint parallel execution is used, then a pylint management process will use ~45MB and each
+# pylint worker process will consume about the same amount of memory as a non-parallel run (for the
+# full set of files being checked across all workers, not for the subset of files being checked by
+# each worker).
+#
+# Due to this behavior, running pylint on all HA files (especially with `pylint -j 0 ...` on a
+# system with many CPU cores) is likely to run the system out of memory and cause processes to be
+# killed.
+#
+# To avoid that, this script detects the amount of available memory and splits a single pylint run
+# on many files into multiple runs on subsets of the files to control memory usage.  If the system
+# is severely memory constrained, this script will also limit parallel execution.
+#
+# Per https://pylint.pycqa.org/en/stable/user_guide/usage/run.html#parallel-execution note that
+# splitting runs like this may reduce the effectiveness of pylint's type inference.
+# We could prefer reducing the number of parallel pylint processes over splitting runs in order to
+# preserve the effectiveness of type inference.
+# However, since HA already uses mypy (which performs explicit type checking), and pylint's type
+# inference likely provides little additional value on top of mypy, it is probably better to
+# prioritize parallel execution over type inference effectiveness.
+#
+
+# Assume pylint will use 100MB for the first file, 500KB for each additional file, and 60MB for the
+# parallel management process.  (~1.3x the measured values, for a safety margin.)
+BASE_MB=100
+FILE_KB=500
+MGMT_MB=60
+
+SCRIPT_NAME="$(basename "$0")"
+
+# Split the file list from the rest of the pylint command/arguments.
+# pylint allows options to be listed before/after/between files.  Most options take one non-file
+# argument, a few options take one argument which may or may not be a file path/name, and a few
+# options take no arguments.
+# To minimize the amount of knowledge we need to keep synchronized with the pylint argument parser,
+# we track the pylint options that take no arguments, and assume all other options take an argument.
+# If another no-argument option is added to pylint without this list being updated, then we may
+# incorrectly parse a file listed after that option as an argument to the option, resulting in that
+# file being passed to every pylint run (which is inefficient but otherwise should be harmless).
+# In the unlikely case that one of these options is changed to take an argument, then we may
+# incorrectly handle its argument as a file (which would then likely cause pylint to fail due to the
+# missing argument).
+PYLINT_SINGLE_ARG_OPTS=(
+  --errors-only -E --verbose -v --enable-all-extensions --exit-zero
+)
+# The following pylint options cause pylint to exit before scanning any files.  If we encounter any
+# of these then it should be safe to run pylint with all of the provided arguments.
+PYLINT_CMD_OPTS=(
+  --help -h --help-msg --long-help --full-documentation
+  --list-msgs --list-msgs-enabled --list-groups --list-conf-levels --list-extensions
+  --generate-rcfile --generate-toml-config
+)
+# Create hash tables ("associative arrays") from the opts lists above, for easy lookups.
+TMP_ARR=(${PYLINT_SINGLE_ARG_OPTS[*]/#/[}) ; TMP_ARR=(${TMP_ARR[*]/%/]=y})
+unset PYLINT_SINGLE_ARG_OPTS ; declare -A "PYLINT_SINGLE_ARG_OPTS=(${TMP_ARR[*]})"
+TMP_ARR=(${PYLINT_CMD_OPTS[*]/#/[}) ; TMP_ARR=(${TMP_ARR[*]/%/]=y})
+unset PYLINT_CMD_OPTS ; declare -A "PYLINT_CMD_OPTS=(${TMP_ARR[*]})"
+unset TMP_ARR
+# Loop through the arguments and classify them.
+PYLINT_CMD=("$1") FILES=()
+OPT_ARG='n'
+for ARG in "${@:2}" ; do
+  if [ "$OPT_ARG" = 'y' ] ; then
+    PYLINT_CMD+=("$ARG") OPT_ARG='n'
+  elif [ -n "${PYLINT_CMD_OPTS[$ARG]}" ] ; then  # if ARG in PYLINT_CMD_OPTS:
+    PYLINT_CMD=("$@") FILES=()
+    break
+  elif [ -n "${PYLINT_SINGLE_ARG_OPTS[$ARG]}" ] ; then  # if ARG in PYLINT_SINGLE_ARG_OPTS:
+    PYLINT_CMD+=("$ARG")
+  elif [ "$ARG" != "${ARG#-}" ] ; then  # if ARG.startswith('#'):
+    PYLINT_CMD+=("$ARG") OPT_ARG='y'
+  else
+    FILES+=("$ARG")
+  fi
+done
+
+# Determine available memory.
+if [ -f '/sys/fs/cgroup/memory.max' ] ; then
+  FREE_B="$(cat '/sys/fs/cgroup/memory.max')"
+  FREE_MB=$(( $FREE_B/1024/1024 )) ; unset FREE_KB
+else
+  FREE_MB="$(awk '/MemFree/ { printf "%.0f \n", $2/1024 }' /proc/meminfo)"
+fi
+[ "$FREE_MB" -gt 0 ]  # Fail if $FREE_MB is not an integer
+
+# Fail if there is insufficient memory to run pylint at all.
+if [ "$FREE_MB" -lt "$BASE_MB" ] ; then
+  if [ -n "$PYLINT_MEM_FORCE" ] ; then
+    echo "$SCRIPT_NAME WARN: Insufficient free memory to run pylint (${FREE_MB}MB < ${BASE_MB}MB)" >&2
+    echo "Running anyway per PYLINT_MEM_FORCE environment variable."
+  else
+    echo "$SCRIPT_NAME ERROR: Insufficient free memory to run pylint (${FREE_MB}MB < ${BASE_MB}MB)" >&2
+    echo "Set environment variable PYLINT_MEM_FORCE=y to run anyway."
+    exit 2
+  fi
+fi
+
+# If no files were given, or if pylint will exit before scanning any files, then disable parallel
+# execution (to avoid unnecessary memory consumption for the management process given that there
+# will only be one worker anyway) and run pylint with all of the provided arguments.
+# Note that if the same option is provided to pylint multiple times then the last instance will take
+# precedence, so we don't need to strip any existing --jobs or -j options, and can simply append
+# another -j option to disable parallel execution.
+FILES_CNT="${#FILES[@]}"
+if [ "$FILES_CNT" -eq 0 ] ; then
+  exec "${PYLINT_CMD[@]}" -j 1
+fi
+
+# Determine number of available CPUs/cores.
+CPUS="$(nproc)"
+
+# Determine how many parallel pylint processes we have memory for.
+JOBS=$(( ($FREE_MB-$MGMT_MB)/$BASE_MB ))
+[ "$JOBS" -lt 1 ] && JOBS=1
+[ "$JOBS" -gt "$CPUS" ] && JOBS="$CPUS"
+
+# Determine how many files per pylint run we have memory for.
+[ "$JOBS" -eq 1 ] && JOBS_MB="$BASE_MB" || JOBS_MB=$(( $MGMT_MB+($BASE_MB*$JOBS) ))
+# +1 because BASE_MB includes the first file
+FILES_PER_RUN=$(( (($FREE_MB-$JOBS_MB)*1024/($FILE_KB*$JOBS))+1 ))
+[ "$FILES_PER_RUN" -lt 1 ] && FILES_PER_RUN=1
+
+# If we have sufficient memory then run pylint once for all files.
+if [ "$FILES_PER_RUN" -ge "$FILES_CNT" ] ; then
+  exec "${PYLINT_CMD[@]}" "${FILES[@]}" -j "$JOBS"
+fi
+
+# Run pylint repeatedly for subsets of files.  Continue after errors.
+RET=0
+for (( I=0 ; I<FILES_CNT ; I+=FILES_PER_RUN )) ; do
+  "${PYLINT_CMD[@]}" "${FILES[@]:$I:$FILES_PER_RUN}" -j "$JOBS" || RET=$?
+done
+exit $RET
